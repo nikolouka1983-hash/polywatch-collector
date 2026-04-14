@@ -22,21 +22,19 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Download existing database
-        uses: dawidd6/action-download-artifact@v3
+      - name: Restore database from cache
+        uses: actions/cache@v4
         with:
-          name: polywatch-database
-          path: .
-          if_no_artifact_found: ignore
-        continue-on-error: true
+          path: polywatch.db
+          key: polywatch-db-${{ github.run_number }}
+          restore-keys: |
+            polywatch-db-
 
       - name: Run collector
         run: |
@@ -47,12 +45,42 @@ jobs:
           fi
         env:
           POLYWATCH_DB: polywatch.db
-          POLYWATCH_LIMIT: "200"
+          POLYWATCH_LIMIT: '200'
           POLYWATCH_LOG: collector.log
+
+      - name: Show DB stats
+        run: |
+          python3 - << 'EOF'
+          import sqlite3, os
+          if not os.path.exists('polywatch.db'):
+              print('No database found')
+          else:
+              conn = sqlite3.connect('polywatch.db')
+              total = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+              unique = conn.execute("SELECT COUNT(DISTINCT market_id) FROM snapshots").fetchone()[0]
+              res = conn.execute("SELECT COUNT(*) FROM resolutions").fetchone()[0]
+              divs = conn.execute("SELECT COUNT(*) FROM divergences").fetchone()[0]
+              first = conn.execute("SELECT MIN(captured_at) FROM snapshots").fetchone()[0]
+              last = conn.execute("SELECT MAX(captured_at) FROM snapshots").fetchone()[0]
+              print(f'Snapshots:   {total:,}')
+              print(f'Markets:     {unique:,}')
+              print(f'Resolutions: {res:,}')
+              print(f'Divergences: {divs:,}')
+              print(f'First run:   {first}')
+              print(f'Latest run:  {last}')
+              conn.close()
+          EOF
 
       - name: Show collector log
         if: always()
         run: cat collector.log 2>/dev/null || echo "No log file"
+
+      - name: Save database to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: polywatch.db
+          key: polywatch-db-${{ github.run_number }}
 
       - name: Upload database artifact
         uses: actions/upload-artifact@v4
