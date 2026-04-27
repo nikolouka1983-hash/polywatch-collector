@@ -1,0 +1,59 @@
+name: Polywatch Weekly Analysis
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'
+  workflow_dispatch:
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore database from cache
+        uses: actions/cache@v4
+        with:
+          path: polywatch.db
+          key: polywatch-db-${{ github.run_number }}
+          restore-keys: |
+            polywatch-db-
+
+      - name: Install dependencies
+        run: pip install py-clob-client web3 --break-system-packages -q
+
+      - name: Run weekly analysis
+        run: python3 bot.py analyse
+        env:
+          POLYWATCH_DB: polywatch.db
+
+      - name: Run signal scan
+        run: python3 bot.py scan
+        env:
+          POLYWATCH_DB: polywatch.db
+
+      - name: Show bot status
+        run: python3 bot.py status
+        env:
+          POLYWATCH_DB: polywatch.db
+
+      - name: Save database
+        uses: actions/cache/save@v4
+        with:
+          path: polywatch.db
+          key: polywatch-db-${{ github.run_number }}
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-analysis-${{ github.run_number }}
+          path: bot.log
+          retention-days: 90
