@@ -6,15 +6,12 @@ Scans live Polymarket markets for signals matching backtested rules,
 places trades via the CLOB API, tracks performance, and automatically
 re-evaluates + adjusts rules weekly.
 
-Setup:
-  1. Set POLY_PRIVATE_KEY in your environment (your wallet private key)
-  2. Run:  python3 bot.py setup        -- generate API keys from wallet
-  3. Run:  python3 bot.py scan         -- scan for signals (dry run)
-  4. Run:  python3 bot.py trade        -- live trading mode
-  5. Run:  python3 bot.py analyse      -- re-evaluate rules from DB
-  6. Run:  python3 bot.py status       -- show open positions + P&L
-
-NEVER share your private key. Store it as an env variable only.
+Commands:
+  python3 bot.py setup    -- generate API keys from wallet (run once)
+  python3 bot.py scan     -- scan for signals, no trades
+  python3 bot.py trade    -- place dry-run or live trades (single pass)
+  python3 bot.py analyse  -- re-evaluate rules from resolved trades
+  python3 bot.py status   -- show open positions + P&L
 """
 
 import json
@@ -29,17 +26,18 @@ import random
 import traceback
 
 DB_PATH          = os.environ.get("POLYWATCH_DB", "polywatch.db")
+MARKETS_LIMIT    = 200
+LOG_FILE         = "bot.log"
 POLY_HOST        = "https://clob.polymarket.com"
 GAMMA_HOST       = "https://gamma-api.polymarket.com"
 CHAIN_ID         = 137
 MAX_POSITION_USD = 100
 MAX_OPEN         = 5
-RESERVE_PCT      = 0.50
 MIN_LIQUIDITY    = 50000
 MIN_HOURS        = 2
-DRY_RUN          = True
 
-LOG_FILE = "bot.log"
+# Read DRY_RUN from environment so GitHub Actions workflow can control it
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 
 RULES = [
     {
@@ -48,12 +46,12 @@ RULES = [
         "description": "Sports markets (NFL/UCL/LoL/PL) resolve YES 60-86% historically",
         "direction":   "YES",
         "conditions": {
-            "categories":     ["NFL", "UEFA Champions League", "League of Legends",
-                               "Premier League", "NBA", "MLB", "CFB"],
-            "prob_min":       0.55,
-            "prob_max":       0.80,
-            "vol_min":        50000,
-            "hours_max":      72,
+            "categories":      ["NFL", "UEFA Champions League", "League of Legends",
+                                "Premier League", "NBA", "MLB", "CFB"],
+            "prob_min":        0.55,
+            "prob_max":        0.80,
+            "vol_min":         50000,
+            "hours_max":       72,
             "spike_ratio_min": 0.0,
         },
         "expected_win_rate": 0.68,
@@ -66,12 +64,12 @@ RULES = [
         "description": "Speculative Fed rate moves resolve NO 79% historically",
         "direction":   "NO",
         "conditions": {
-            "categories":     ["FOMC", "Bitcoin Hit Price Monthly",
-                               "When will Bitcoin hit", "US strikes"],
-            "prob_min":       0.20,
-            "prob_max":       0.45,
-            "vol_min":        500000,
-            "hours_max":      168,
+            "categories":      ["FOMC", "Bitcoin Hit Price Monthly",
+                                "When will Bitcoin hit", "US strikes"],
+            "prob_min":        0.20,
+            "prob_max":        0.45,
+            "vol_min":         500000,
+            "hours_max":       168,
             "spike_ratio_min": 0.0,
         },
         "expected_win_rate": 0.79,
@@ -81,14 +79,14 @@ RULES = [
     {
         "id":          "C_spike_follow",
         "name":        "Volume spike follow",
-        "description": "80%+ spike ratio = informed traders entering -- follow direction",
+        "description": "80%+ spike = informed traders entering -- follow direction",
         "direction":   "FOLLOW",
         "conditions": {
-            "categories":     [],
-            "prob_min":       0.30,
-            "prob_max":       0.70,
-            "vol_min":        80000,
-            "hours_max":      48,
+            "categories":      [],
+            "prob_min":        0.30,
+            "prob_max":        0.70,
+            "vol_min":         80000,
+            "hours_max":       48,
             "spike_ratio_min": 0.80,
         },
         "expected_win_rate": 0.60,
@@ -112,11 +110,8 @@ def log(msg, level="INFO"):
 
 
 def get_headers(api_key=None):
-    h = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    h = {"User-Agent": random.choice(USER_AGENTS), "Accept": "application/json",
+         "Content-Type": "application/json"}
     if api_key:
         h["POLY-API-KEY"] = api_key
     return h
@@ -126,11 +121,8 @@ def fetch(url, data=None, method="GET", api_key=None, retries=3):
     for attempt in range(retries):
         try:
             body = json.dumps(data).encode() if data else None
-            req = urllib.request.Request(
-                url, data=body,
-                headers=get_headers(api_key),
-                method=method if body else "GET"
-            )
+            req = urllib.request.Request(url, data=body,
+                headers=get_headers(api_key), method=method if body else "GET")
             with urllib.request.urlopen(req, timeout=20) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
@@ -147,40 +139,23 @@ def fetch(url, data=None, method="GET", api_key=None, retries=3):
 def init_db(conn):
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS bot_trades (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at      TEXT NOT NULL,
-        market_id       TEXT NOT NULL,
-        question        TEXT NOT NULL,
-        rule_id         TEXT NOT NULL,
-        direction       TEXT NOT NULL,
-        entry_prob      REAL NOT NULL,
-        entry_price     REAL NOT NULL,
-        size_usdc       REAL NOT NULL,
-        shares          REAL,
-        order_id        TEXT,
-        status          TEXT DEFAULT 'open',
-        resolved_at     TEXT,
-        outcome         TEXT,
-        exit_price      REAL,
-        pnl_usdc        REAL,
-        pnl_pct         REAL,
-        notes           TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL, market_id TEXT NOT NULL,
+        question TEXT NOT NULL, rule_id TEXT NOT NULL,
+        direction TEXT NOT NULL, entry_prob REAL NOT NULL,
+        entry_price REAL NOT NULL, size_usdc REAL NOT NULL,
+        shares REAL, order_id TEXT, status TEXT DEFAULT 'open',
+        resolved_at TEXT, outcome TEXT, exit_price REAL,
+        pnl_usdc REAL, pnl_pct REAL, notes TEXT
     );
     CREATE TABLE IF NOT EXISTS rule_performance (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        evaluated_at    TEXT NOT NULL,
-        rule_id         TEXT NOT NULL,
-        trades_total    INTEGER,
-        trades_won      INTEGER,
-        win_rate        REAL,
-        avg_pnl_pct     REAL,
-        total_pnl_usdc  REAL,
-        recommendation  TEXT
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        evaluated_at TEXT NOT NULL, rule_id TEXT NOT NULL,
+        trades_total INTEGER, trades_won INTEGER, win_rate REAL,
+        avg_pnl_pct REAL, total_pnl_usdc REAL, recommendation TEXT
     );
     CREATE TABLE IF NOT EXISTS bot_config (
-        key     TEXT PRIMARY KEY,
-        value   TEXT,
-        updated TEXT
+        key TEXT PRIMARY KEY, value TEXT, updated TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_trades_status ON bot_trades(status);
     CREATE INDEX IF NOT EXISTS idx_trades_rule   ON bot_trades(rule_id);
@@ -194,17 +169,15 @@ def get_config(conn, key, default=None):
 
 
 def set_config(conn, key, value):
-    conn.execute(
-        "INSERT OR REPLACE INTO bot_config (key, value, updated) VALUES (?,?,?)",
-        (key, str(value), datetime.datetime.now(datetime.timezone.utc).isoformat())
-    )
+    conn.execute("INSERT OR REPLACE INTO bot_config (key, value, updated) VALUES (?,?,?)",
+        (key, str(value), datetime.datetime.now(datetime.timezone.utc).isoformat()))
     conn.commit()
 
+
 def get_live_markets():
-    log("Fetching live markets from Gamma API...")
-    time.sleep(random.randint(1, 5))
-    url = f"{GAMMA_HOST}/markets?limit=200&active=true&closed=false&order=volume24hr&ascending=false"
-    return fetch(url)
+    log("Fetching live markets...")
+    time.sleep(random.randint(1, 8))
+    return fetch(f"{GAMMA_HOST}/markets?limit={MARKETS_LIMIT}&active=true&closed=false&order=volume24hr&ascending=false")
 
 
 def parse_prob(m, idx=0):
@@ -220,8 +193,7 @@ def get_category(m):
     events = m.get("events") or []
     series = (events[0].get("series") or []) if events else []
     return series[0].get("title", "Other")[:50] if series else (
-        events[0].get("title", "Other")[:50] if events else "Other"
-    )
+        events[0].get("title", "Other")[:50] if events else "Other")
 
 
 def hours_until(date_str):
@@ -241,10 +213,6 @@ def spike_ratio(m):
     return v24 / vt if vt > 0 else 0
 
 
-def get_orderbook(token_id):
-    return fetch(f"{POLY_HOST}/book?token_id={token_id}")
-
-
 def get_token_ids(m):
     raw = m.get("clobTokenIds", "[]")
     try:
@@ -255,16 +223,15 @@ def get_token_ids(m):
 
 def match_rule(m, rule):
     conds = rule["conditions"]
-    prob = parse_prob(m, 0)
-    vol = m.get("volume24hr") or 0
+    prob  = parse_prob(m, 0)
+    vol   = m.get("volume24hr") or 0
     hours = hours_until(m.get("endDate"))
-    sr = spike_ratio(m)
-    cat = get_category(m)
+    sr    = spike_ratio(m)
+    cat   = get_category(m)
     if prob is None:
         return False, None, 0
     if conds["categories"]:
-        cat_match = any(c.lower() in cat.lower() for c in conds["categories"])
-        if not cat_match:
+        if not any(c.lower() in cat.lower() for c in conds["categories"]):
             return False, None, 0
     if vol < conds["vol_min"]:
         return False, None, 0
@@ -302,7 +269,6 @@ def scan_signals(markets):
                 continue
             matched, direction, confidence = match_rule(m, rule)
             if matched:
-                prob = parse_prob(m, 0)
                 signals.append({
                     "market_id":   str(m.get("id", "")),
                     "question":    m.get("question", "")[:200],
@@ -310,7 +276,7 @@ def scan_signals(markets):
                     "rule_id":     rule["id"],
                     "rule_name":   rule["name"],
                     "direction":   direction,
-                    "yes_prob":    prob,
+                    "yes_prob":    parse_prob(m, 0),
                     "volume_24h":  m.get("volume24hr", 0),
                     "spike_ratio": spike_ratio(m),
                     "hours":       hours_until(m.get("endDate")),
@@ -324,7 +290,7 @@ def scan_signals(markets):
 
 def get_best_price(token_id, direction):
     try:
-        ob = get_orderbook(token_id)
+        ob = fetch(f"{POLY_HOST}/book?token_id={token_id}")
         if direction == "YES":
             asks = ob.get("asks", [])
             if asks:
@@ -347,21 +313,14 @@ def calculate_position_size(prob, rule, available_balance):
     b = (1 / price) - 1
     if b <= 0:
         return 0
-    kelly_fraction = (p * b - q) / b
-    half_kelly = kelly_fraction * 0.5
-    size = min(
-        MAX_POSITION_USD,
-        available_balance * 0.10,
-        available_balance * half_kelly,
-    )
-    return max(0, size)
+    kelly = ((p * b - q) / b) * 0.5
+    return max(0, min(MAX_POSITION_USD, available_balance * 0.10, available_balance * kelly))
 
 
 def place_order(conn, signal, api_key, balance_usdc):
     m = signal["market"]
     token_ids = get_token_ids(m)
     if not token_ids:
-        log(f"No token IDs for {signal['question'][:50]}", "WARN")
         return False
     token_id = token_ids[0] if signal["direction"] == "YES" else token_ids[1]
     price = get_best_price(token_id, signal["direction"])
@@ -369,44 +328,32 @@ def place_order(conn, signal, api_key, balance_usdc):
         log(f"Could not get price for {signal['question'][:50]}", "WARN")
         return False
     existing = conn.execute(
-        "SELECT id FROM bot_trades WHERE market_id=? AND status='open'",
-        (signal["market_id"],)
-    ).fetchone()
+        "SELECT id FROM bot_trades WHERE market_id=? AND status IN ('open','dry_run')",
+        (signal["market_id"],)).fetchone()
     if existing:
-        log(f"Already have open position in {signal['question'][:40]}")
         return False
     open_count = conn.execute(
-        "SELECT COUNT(*) FROM bot_trades WHERE status='open'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM bot_trades WHERE status IN ('open','dry_run')").fetchone()[0]
     if open_count >= MAX_OPEN:
-        log(f"Max open positions ({MAX_OPEN}) reached, skipping")
+        log(f"Max open positions ({MAX_OPEN}) reached")
         return False
     size = calculate_position_size(signal["yes_prob"],
-                                   next(r for r in RULES if r["id"] == signal["rule_id"]),
-                                   balance_usdc)
+        next(r for r in RULES if r["id"] == signal["rule_id"]), balance_usdc)
     if size < 5:
-        log(f"Position too small (${size:.2f}), skipping")
         return False
     shares = size / price
-    log(f"{'[DRY RUN] ' if DRY_RUN else ''}SIGNAL: {signal['rule_name']}")
-    log(f"  Market:    {signal['question'][:60]}")
-    log(f"  Direction: {signal['direction']} @ {price:.3f}")
-    log(f"  Size:      ${size:.2f} = {shares:.1f} shares")
-    log(f"  Expected win rate: {signal['expected_wr']*100:.0f}%")
-    log(f"  Hours to resolve:  {signal['hours']:.1f}h")
+    tag = "[DRY RUN]" if DRY_RUN else "[LIVE]"
+    log(f"{tag} TRADE: {signal['rule_name']} | {signal['direction']} | {signal['question'][:55]}")
+    log(f"  Price: {price:.3f} | Size: ${size:.2f} | Shares: {shares:.1f} | WR: {signal['expected_wr']*100:.0f}% | {signal['hours']:.1f}h")
     order_id = None
     if not DRY_RUN:
         try:
-            order_data = {
-                "token_id":   token_id,
-                "price":      str(round(price, 4)),
-                "size":       str(round(shares, 2)),
-                "side":       "BUY",
-                "order_type": "FOK",
-            }
-            result = fetch(f"{POLY_HOST}/order", data=order_data, method="POST", api_key=api_key)
+            result = fetch(f"{POLY_HOST}/order",
+                data={"token_id": token_id, "price": str(round(price,4)),
+                      "size": str(round(shares,2)), "side": "BUY", "order_type": "FOK"},
+                method="POST", api_key=api_key)
             order_id = result.get("orderID") or result.get("id")
-            log(f"  Order placed: {order_id}")
+            log(f"  Order ID: {order_id}")
         except Exception as e:
             log(f"  Order failed: {e}", "ERROR")
             return False
@@ -415,164 +362,116 @@ def place_order(conn, signal, api_key, balance_usdc):
         (created_at, market_id, question, rule_id, direction,
          entry_prob, entry_price, size_usdc, shares, order_id, status, notes)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        signal["market_id"], signal["question"][:200],
-        signal["rule_id"], signal["direction"],
-        signal["yes_prob"], price, size, shares, order_id,
-        "dry_run" if DRY_RUN else "open",
-        f"Vol: ${signal['volume_24h']/1000:.0f}K | Spike: {signal['spike_ratio']*100:.0f}% | {signal['hours']:.1f}h"
-    ))
+    """, (datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          signal["market_id"], signal["question"][:200], signal["rule_id"],
+          signal["direction"], signal["yes_prob"], price, size, shares, order_id,
+          "dry_run" if DRY_RUN else "open",
+          f"Rule:{signal['rule_id']} Vol:${signal['volume_24h']/1000:.0f}K Spike:{signal['spike_ratio']*100:.0f}% {signal['hours']:.1f}h"))
     conn.commit()
     return True
 
-def check_open_positions(conn, markets, api_key):
+
+def check_open_positions(conn, markets):
     open_trades = conn.execute(
-        "SELECT * FROM bot_trades WHERE status IN ('open', 'dry_run')"
-    ).fetchall()
+        "SELECT * FROM bot_trades WHERE status IN ('open','dry_run')").fetchall()
     if not open_trades:
         return
-    market_map = {str(m.get("id", "")): m for m in markets}
+    market_map = {str(m.get("id","")): m for m in markets}
     for t in open_trades:
-        mid = t["market_id"]
-        if mid not in market_map:
+        m = market_map.get(t["market_id"])
+        if not m:
             continue
-        m = market_map[mid]
         prob = parse_prob(m, 0)
-        if prob is None:
+        if prob is None or (0.03 < prob < 0.97):
             continue
-        if prob >= 0.98:
-            resolved_yes = True
-        elif prob <= 0.02:
-            resolved_yes = False
-        else:
-            continue
-        if (t["direction"] == "YES" and resolved_yes) or \
-           (t["direction"] == "NO" and not resolved_yes):
-            outcome = "WIN"
-            exit_price = 1.0
-            pnl_usdc = t["shares"] * (1.0 - t["entry_price"])
-        else:
-            outcome = "LOSS"
-            exit_price = 0.0
-            pnl_usdc = -t["size_usdc"]
-        pnl_pct = pnl_usdc / t["size_usdc"] if t["size_usdc"] > 0 else 0
+        resolved_yes = prob >= 0.97
+        win = (t["direction"] == "YES" and resolved_yes) or (t["direction"] == "NO" and not resolved_yes)
+        outcome    = "WIN" if win else "LOSS"
+        exit_price = 1.0 if win else 0.0
+        pnl_usdc   = t["shares"] * (1.0 - t["entry_price"]) if win else -t["size_usdc"]
+        pnl_pct    = pnl_usdc / t["size_usdc"] if t["size_usdc"] > 0 else 0
         conn.execute("""
-            UPDATE bot_trades
-            SET status='resolved', resolved_at=?, outcome=?,
-                exit_price=?, pnl_usdc=?, pnl_pct=?
-            WHERE id=?
-        """, (
-            datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            outcome, exit_price, pnl_usdc, pnl_pct, t["id"]
-        ))
+            UPDATE bot_trades SET status='resolved', resolved_at=?,
+            outcome=?, exit_price=?, pnl_usdc=?, pnl_pct=? WHERE id=?
+        """, (datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              outcome, exit_price, pnl_usdc, pnl_pct, t["id"]))
         conn.commit()
-        emoji = "WIN" if outcome == "WIN" else "LOSS"
-        log(f"{emoji} Resolved: {t['question'][:50]} -- {outcome} P&L: ${pnl_usdc:+.2f} ({pnl_pct*100:+.1f}%)")
+        emoji = "WIN" if win else "LOSS"
+        log(f"{emoji}: {t['question'][:55]} | P&L: ${pnl_usdc:+.2f} ({pnl_pct*100:+.1f}%)")
 
 
 def analyse_rules(conn):
-    log("\n" + "=" * 60)
-    log("WEEKLY RULE ANALYSIS")
-    log("=" * 60)
+    log("\n" + "="*60)
+    log("RULE ANALYSIS")
+    log("="*60)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for rule in RULES:
         trades = conn.execute(
             "SELECT * FROM bot_trades WHERE rule_id=? AND status='resolved' ORDER BY created_at",
-            (rule["id"],)
-        ).fetchall()
+            (rule["id"],)).fetchall()
         if not trades:
-            log(f"\nRule {rule['id']}: No resolved trades yet")
+            log(f"\n{rule['name']}: No resolved trades yet")
             continue
-        wins = [t for t in trades if t["outcome"] == "WIN"]
+        wins     = [t for t in trades if t["outcome"] == "WIN"]
         win_rate = len(wins) / len(trades)
-        avg_pnl = sum(t["pnl_pct"] for t in trades) / len(trades)
-        total_pnl = sum(t["pnl_usdc"] for t in trades)
-        log(f"\nRule: {rule['name']}")
-        log(f"  Trades: {len(trades)} | Win rate: {win_rate*100:.1f}% | Expected: {rule['expected_win_rate']*100:.1f}%")
-        log(f"  Avg P&L: {avg_pnl*100:+.1f}% | Total P&L: ${total_pnl:+.2f}")
-        rec = None
-        if len(trades) >= 10:
+        avg_pnl  = sum(t["pnl_pct"] for t in trades) / len(trades)
+        total    = sum(t["pnl_usdc"] for t in trades)
+        log(f"\n{rule['name']}: {len(trades)} trades | WR {win_rate*100:.1f}% (exp {rule['expected_win_rate']*100:.0f}%) | P&L ${total:+.2f}")
+        if len(trades) >= 5:
             if win_rate < rule["expected_win_rate"] - 0.15:
-                rec = f"UNDERPERFORMING: Actual {win_rate*100:.0f}% vs expected {rule['expected_win_rate']*100:.0f}%. Tighten prob range or pause."
-                log(f"  WARN: {rec}")
+                rec = f"UNDERPERFORMING — consider pausing"
             elif win_rate > rule["expected_win_rate"] + 0.10:
-                rec = f"OUTPERFORMING: {win_rate*100:.0f}% vs expected {rule['expected_win_rate']*100:.0f}%. Consider increasing size."
-                log(f"  GREAT: {rec}")
+                rec = f"OUTPERFORMING — consider increasing size"
             else:
-                rec = f"ON TRACK: {win_rate*100:.0f}% win rate matches expectations."
-                log(f"  OK: {rec}")
-            if total_pnl < -50:
-                rec += " ALERT: Total P&L below -$50. Review immediately."
-                log(f"  ALERT: Total P&L: ${total_pnl:.2f}")
-        else:
-            rec = f"Insufficient data ({len(trades)} trades). Need 10+ to evaluate."
-            log(f"  INFO: {rec}")
-        conn.execute("""
-            INSERT INTO rule_performance
-            (evaluated_at, rule_id, trades_total, trades_won, win_rate, avg_pnl_pct, total_pnl_usdc, recommendation)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (now, rule["id"], len(trades), len(wins), win_rate, avg_pnl, total_pnl, rec))
+                rec = f"ON TRACK"
+            log(f"  Status: {rec}")
+            conn.execute("""INSERT INTO rule_performance
+                (evaluated_at,rule_id,trades_total,trades_won,win_rate,avg_pnl_pct,total_pnl_usdc,recommendation)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (now, rule["id"], len(trades), len(wins), win_rate, avg_pnl, total, rec))
     conn.commit()
-    try:
-        rows = conn.execute("""
-            SELECT category, COUNT(*) as n,
-                   SUM(CASE WHEN resolved_yes=1 THEN 1 ELSE 0 END) as yes_n,
-                   SUM(total_volume)/1e6 as vol_m
-            FROM historical_markets
-            WHERE resolved_yes IS NOT NULL AND total_volume >= 10000
-            GROUP BY category HAVING n >= 5 ORDER BY n DESC LIMIT 15
-        """).fetchall()
-        if rows:
-            log(f"{'Category':35} {'N':>5} {'YES%':>6} {'Edge':>6}")
-            for r in rows:
-                yes_pct = (r["yes_n"] / r["n"]) * 100
-                log(f"{(r['category'] or 'Other')[:35]:35} {r['n']:>5} {yes_pct:>5.0f}% {yes_pct-50:>+5.0f}%")
-    except Exception as e:
-        log(f"Historical analysis error: {e}")
-    log("=" * 60)
+    log("="*60)
 
 
 def show_status(conn):
-    print("\n" + "=" * 65)
+    print("\n" + "="*65)
     print("POLYWATCH BOT STATUS")
-    print("=" * 65)
-    open_trades = conn.execute(
-        "SELECT * FROM bot_trades WHERE status IN ('open','dry_run') ORDER BY created_at DESC"
-    ).fetchall()
-    print(f"\nOpen positions: {len(open_trades)}")
-    for t in open_trades:
-        print(f"  {t['direction']:3} {t['question'][:50]:50} | ${t['size_usdc']:.0f} @ {t['entry_price']:.3f}")
+    print("="*65)
+    open_t = conn.execute(
+        "SELECT * FROM bot_trades WHERE status IN ('open','dry_run') ORDER BY created_at DESC").fetchall()
     resolved = conn.execute(
-        "SELECT * FROM bot_trades WHERE status='resolved' ORDER BY resolved_at DESC"
-    ).fetchall()
+        "SELECT * FROM bot_trades WHERE status='resolved' ORDER BY resolved_at DESC").fetchall()
+    print(f"\nOpen/dry-run positions: {len(open_t)}")
+    for t in open_t:
+        print(f"  {t['direction']:3} {t['question'][:52]:52} | ${t['size_usdc']:.0f} @ {t['entry_price']:.3f} | {t['rule_id']}")
     if resolved:
-        wins = [t for t in resolved if t["outcome"] == "WIN"]
-        total_pnl = sum(t["pnl_usdc"] for t in resolved)
+        wins     = [t for t in resolved if t["outcome"] == "WIN"]
+        total    = sum(t["pnl_usdc"] for t in resolved)
         win_rate = len(wins) / len(resolved) * 100
-        print(f"\nResolved: {len(resolved)} | Win rate: {win_rate:.1f}% | Total P&L: ${total_pnl:+.2f}")
-        for t in resolved[:10]:
-            emoji = "WIN" if t["outcome"] == "WIN" else "LOSS"
-            print(f"  {emoji} {t['direction']:3} {t['question'][:45]:45} | ${t['pnl_usdc']:+.2f}")
-    print("=" * 65)
+        print(f"\nResolved: {len(resolved)} | Win rate: {win_rate:.1f}% | Total P&L: ${total:+.2f}")
+        for t in resolved[:15]:
+            r = "WIN" if t["outcome"] == "WIN" else "LOSS"
+            print(f"  {r} {t['direction']:3} {t['question'][:48]:48} | ${t['pnl_usdc']:+.2f}")
+    else:
+        print("\nNo resolved trades yet.")
+    print("="*65)
 
 
 def setup_api_keys(conn):
     private_key = os.environ.get("POLY_PRIVATE_KEY")
     if not private_key:
-        print("ERROR: Set POLY_PRIVATE_KEY environment variable first.")
-        print("  export POLY_PRIVATE_KEY=0x...")
+        print("Set POLY_PRIVATE_KEY env var first.")
         sys.exit(1)
     try:
         from py_clob_client.client import ClobClient
         client = ClobClient(host=POLY_HOST, chain_id=CHAIN_ID, key=private_key, signature_type=1)
-        resp = client.create_api_key()
+        resp   = client.create_api_key()
         set_config(conn, "api_key",        resp.api_key)
         set_config(conn, "api_secret",     resp.api_secret)
         set_config(conn, "api_passphrase", resp.api_passphrase)
-        print(f"API keys generated and stored. Wallet: {client.get_address()}")
+        print(f"API keys generated. Wallet: {client.get_address()}")
     except ImportError:
-        print("Install: pip install py-clob-client")
+        print("pip install py-clob-client")
         sys.exit(1)
     except Exception as e:
         print(f"Setup failed: {e}")
@@ -580,71 +479,73 @@ def setup_api_keys(conn):
 
 
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "scan"
+    cmd  = sys.argv[1] if len(sys.argv) > 1 else "scan"
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     init_db(conn)
+
     if cmd == "setup":
         setup_api_keys(conn)
         conn.close()
         return
+
     if cmd == "status":
         show_status(conn)
         conn.close()
         return
+
     if cmd == "analyse":
         analyse_rules(conn)
         conn.close()
         return
+
+    # scan or trade — always single-shot (one pass, no loop)
     global DRY_RUN
     if cmd == "trade":
-        DRY_RUN = False
-        log("LIVE TRADING MODE -- real money will be spent")
-        api_key = get_config(conn, "api_key")
-        if not api_key:
-            print("Run 'python3 bot.py setup' first")
+        # DRY_RUN already set from env — just log the mode
+        mode = "DRY RUN" if DRY_RUN else "LIVE TRADING"
+        log(f"{mode} MODE")
+        api_key = get_config(conn, "api_key") if not DRY_RUN else None
+        if not DRY_RUN and not api_key:
+            print("Run setup first: python3 bot.py setup")
             conn.close()
             return
     else:
         DRY_RUN = True
         api_key = None
-        log("DRY RUN MODE -- no real trades will be placed")
-    while True:
-        try:
-            log(f"\n{'--'*25}")
-            markets = get_live_markets()
-            log(f"Scanning {len(markets)} markets...")
-            check_open_positions(conn, markets, api_key)
-            signals = scan_signals(markets)
-            log(f"Found {len(signals)} signal(s)")
-            placed = 0
-            for signal in signals:
-                if cmd == "scan":
-                    log(f"  SIGNAL [{signal['rule_name']}] {signal['direction']} -- {signal['question'][:55]}")
-                    log(f"    Prob: {signal['yes_prob']*100:.1f}% | Vol: ${signal['volume_24h']/1000:.0f}K | {signal['hours']:.1f}h | WR: {signal['expected_wr']*100:.0f}%")
-                else:
-                    ok = place_order(conn, signal, api_key, balance_usdc=500)
-                    if ok:
-                        placed += 1
-            if cmd != "scan":
-                log(f"Placed {placed} orders")
-            if datetime.datetime.now(datetime.timezone.utc).weekday() == 6:
-                last = get_config(conn, "last_analysis", "")
-                today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-                if last != today:
-                    analyse_rules(conn)
-                    set_config(conn, "last_analysis", today)
-        except KeyboardInterrupt:
-            log("Bot stopped")
-            break
-        except Exception as e:
-            log(f"Run error: {e}", "ERROR")
-            log(traceback.format_exc(), "ERROR")
-        if cmd == "scan":
-            break
-        log("Sleeping 60 minutes...")
-        time.sleep(3600)
-    conn.close()
+        log("SCAN MODE (no trades)")
+
+    try:
+        log(f"{'─'*50}")
+        markets = get_live_markets()
+        log(f"Scanning {len(markets)} markets...")
+
+        # Check if any existing positions have resolved
+        check_open_positions(conn, markets)
+
+        # Scan for new signals
+        signals = scan_signals(markets)
+        log(f"Found {len(signals)} signal(s)")
+
+        placed = 0
+        for signal in signals:
+            if cmd == "scan":
+                log(f"  SIGNAL [{signal['rule_name']}] {signal['direction']} -- {signal['question'][:55]}")
+                log(f"    Prob:{signal['yes_prob']*100:.1f}% Vol:${signal['volume_24h']/1000:.0f}K {signal['hours']:.1f}h WR:{signal['expected_wr']*100:.0f}%")
+            else:
+                ok = place_order(conn, signal, api_key, balance_usdc=500)
+                if ok:
+                    placed += 1
+
+        if cmd == "trade":
+            log(f"Placed {placed} dry-run trade(s) this pass")
+
+    except Exception as e:
+        log(f"FAILED: {e}", "ERROR")
+        log(traceback.format_exc(), "ERROR")
+        sys.exit(1)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
