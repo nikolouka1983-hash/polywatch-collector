@@ -30,13 +30,20 @@ jobs:
       - name: Install dependencies
         run: pip install py-clob-client web3 --break-system-packages -q
 
-      - name: Run weekly analysis
-        run: python3 bot.py analyse
+      - name: Setup API keys from wallet
+        run: python3 bot.py setup
         env:
           POLYWATCH_DB: polywatch.db
+          POLY_PRIVATE_KEY: ${{ secrets.POLY_PRIVATE_KEY }}
 
-      - name: Run signal scan
+      - name: Run signal scan (dry run)
         run: python3 bot.py scan
+        env:
+          POLYWATCH_DB: polywatch.db
+          POLY_PRIVATE_KEY: ${{ secrets.POLY_PRIVATE_KEY }}
+
+      - name: Run weekly analysis
+        run: python3 bot.py analyse
         env:
           POLYWATCH_DB: polywatch.db
 
