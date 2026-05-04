@@ -1,0 +1,45 @@
+name: Polywatch Scanner v4
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore database
+        uses: actions/cache@v4
+        with:
+          path: polywatch.db
+          key: polywatch-v4-db-${{ github.run_id }}
+          restore-keys: polywatch-v4-db-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scanner
+        run: python scanner_v4.py
+        env:
+          BANKROLL: "10000"
+
+      - name: Save database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: polywatch.db
+          key: polywatch-v4-db-${{ github.run_id }}
+
+      - name: Upload log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scanner-v4-log-${{ github.run_id }}
+          path: scanner_v4.log
+          retention-days: 14
