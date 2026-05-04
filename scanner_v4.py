@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""POLYWATCH SCANNER v4 — capital preservation. No trade under $5 payout."""
+"""
+POLYWATCH SCANNER v4.1 — capital preservation
+
+F6 FIX (post KT Rolster loss):
+  - Esports BANNED (LoL, Dota, CS2, Valorant, gaming)
+  - Min confidence raised 70% → 80%
+  - Major leagues only (UCL, EPL, NBA, NFL, MLB, La Liga, ATP, Grand Slam)
+  - Min liquidity raised $50k → $100k
+  - No qualifiers, no lower-tier tournaments
+"""
 import os, sys, json, sqlite3, datetime, urllib.request, traceback
 
 try:
@@ -13,9 +22,28 @@ LOG_FILE = "scanner_v4.log"
 GAMMA    = "https://gamma-api.polymarket.com"
 HEADERS  = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
 BANKROLL = float(os.environ.get("BANKROLL", BANKROLL_TARGET))
-
-# Hard minimum payout — no trade earns less than this
 MIN_PAYOUT_HARD = 5.0
+
+# F6 ALLOWED LEAGUES — major only, no qualifiers, no esports
+F6_MAJOR_LEAGUES = [
+    "champions league", "ucl", "europa league",
+    "premier league", "epl", "la liga", "bundesliga", "serie a", "ligue 1",
+    "world cup", "euro 2024", "copa america",
+    "nba", "nfl", "mlb", "nhl",
+    "super bowl", "nba finals", "world series", "stanley cup",
+    "wimbledon", "us open", "french open", "australian open", "grand slam",
+    "atp finals", "davis cup",
+    "ufc", "boxing",
+]
+
+# F6 BANNED — esports and lower-tier events
+F6_BANNED = [
+    "league of legends", "lol", "lck", "lcs", "lec",
+    "dota", "dota 2", "cs2", "csgo", "valorant", "overwatch",
+    "esports", "esport", "gaming", "qualifier", "qualifiers",
+    "playoffs", "play-in", "promotion", "relegation",
+    "academy", "challenger", "second division",
+]
 
 def log(msg, level="INFO"):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -75,29 +103,55 @@ def open_count(conn):
     return conn.execute("SELECT COUNT(*) FROM v4_trades WHERE status=?",("open",)).fetchone()[0]
 
 def calc_stake(prob, direction, balance):
-    """Returns (stake, max_payout). Rejects if payout < MIN_PAYOUT_HARD."""
-    stake   = balance * MAX_RISK_PER_TRADE
-    entry   = prob if direction == "YES" else (1 - prob)
+    stake  = balance * MAX_RISK_PER_TRADE
+    entry  = prob if direction == "YES" else (1 - prob)
     if entry <= 0 or entry >= 1: return 0, 0
-    payout  = round((stake / entry) * (1 - entry), 2)
-    if payout < MIN_PAYOUT_HARD:
-        return 0, 0  # caller checks payout == 0 to reject
+    payout = round((stake / entry) * (1 - entry), 2)
+    if payout < MIN_PAYOUT_HARD: return 0, 0
     return round(stake, 2), payout
 
-# ── Scoring strategies ──
+# ── F6: SPORTS ──────────────────────────────────────────────────
 def score_f6_sports(m, prob, hours):
+    """
+    FIX v4.1: Esports banned. Major leagues only. 80%+ confidence. $100k liq.
+    """
     q = m.get("question","").lower()
-    if not any(x in q for x in ["vs.","vs ","game ","match","nba","mlb","ucl","epl","tennis","lol ","dota","valorant"]): return None
-    cfg = STRICT_RULES["F6_sports"]
-    if not (cfg["min_conf"] <= prob <= cfg["max_conf"]): return None
-    if (m.get("spread") or 1.0) > cfg["max_spread"]: return None
-    if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
-    if hours < cfg["min_hours"] or hours > cfg["max_hours"]: return None
+
+    # 1. Ban esports and lower-tier events first
+    if any(x in q for x in F6_BANNED):
+        return None
+
+    # 2. Must be a recognised major league/tournament
+    is_major = any(x in q for x in F6_MAJOR_LEAGUES)
+    if not is_major:
+        return None
+
+    # 3. Must look like a match (vs. pattern)
+    if "vs." not in q and " vs " not in q:
+        return None
+
+    # 4. Confidence 80-92% (raised from 70%)
+    if not (0.80 <= prob <= 0.92):
+        return None
+
+    # 5. Spread < 1.0%
+    if (m.get("spread") or 1.0) > 0.010:
+        return None
+
+    # 6. Liquidity > $100k (raised from $50k)
+    if (m.get("liquidityNum") or 0) < 100000:
+        return None
+
+    # 7. Resolves in 2-24 hours
+    if hours < 2 or hours > 24:
+        return None
+
     return {"rule":"F6_sports","direction":"YES","confidence":prob}
 
+# ── F7: CRYPTO BINARY ───────────────────────────────────────────
 def score_f7_crypto(m, prob, hours):
     q = m.get("question","").lower()
-    if not any(x in q for x in ["bitcoin above","btc above","btc below","bitcoin below","ethereum above","eth above"]): return None
+    if not any(x in q for x in ["bitcoin above","btc above","btc below","bitcoin below","ethereum above","eth above","ethereum below","eth below"]): return None
     cfg = STRICT_RULES["F7_crypto"]
     if hours > cfg["max_hours"]: return None
     if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
@@ -107,10 +161,11 @@ def score_f7_crypto(m, prob, hours):
     if nr[0] <= prob <= nr[1]: return {"rule":"F7_crypto","direction":"NO","confidence":1-prob}
     return None
 
+# ── F8: POLITICAL / NEWS ────────────────────────────────────────
 def score_f8_political(m, prob, hours):
     q = m.get("question","").lower()
-    political = any(x in q for x in ["will trump","ceasefire","executive order","tariff","shutdown","fomc","interest rate"])
-    subjective = any(x in q for x in ["tweet","post","say","mention"])
+    political = any(x in q for x in ["will trump","ceasefire","executive order","tariff","shutdown","fomc","interest rate","federal reserve","will congress","will senate"])
+    subjective = any(x in q for x in ["tweet","post","say","mention","comment"])
     if not political or subjective: return None
     cfg = STRICT_RULES["F8_political"]
     if hours > cfg["max_hours"]: return None
@@ -120,23 +175,21 @@ def score_f8_political(m, prob, hours):
     if nr[0] <= prob <= nr[1]: return {"rule":"F8_political","direction":"NO","confidence":1-prob}
     return None
 
+# ── F1: LONGSHOT NO ─────────────────────────────────────────────
 def score_f1_longshot(m, prob, hours):
-    """
-    F1: Championship/finals outright NO.
-    FIX: min_entry raised to 0.05 (5% YES) so payout at $150 stake > $7.
-         max raised to 0.12 (was 0.10) — slight widening for more signals.
-         Payout double-checked in calc_stake before trade is placed.
-    """
     cfg = STRICT_RULES["F1_longshot_no"]
     if hours < cfg["min_hours"] or hours > cfg["max_hours"]: return None
     if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
     q = m.get("question","").lower()
-    eligible = any(x in q for x in ["world cup","champions league","super bowl","nba final","stanley cup","nba finals","world series","masters","f1 championship"])
+    # Must be a major championship outright winner
+    eligible = any(x in q for x in ["world cup","champions league","super bowl","nba finals","stanley cup","world series","masters","f1 championship","wimbledon","us open tennis","french open","australian open"])
     if not eligible: return None
-    # min 5% YES so payout is meaningful, max 12% so we have edge
+    # Reject if esports snuck in
+    if any(x in q for x in F6_BANNED): return None
     if prob < 0.05 or prob > 0.12: return None
     return {"rule":"F1_longshot_no","direction":"NO","confidence":1-prob}
 
+# ── SCAN ────────────────────────────────────────────────────────
 def scan(conn):
     balance = get_balance(conn)
     daily   = get_pnl_window(conn, 24)
@@ -150,7 +203,7 @@ def scan(conn):
         log("Fetched " + str(len(markets)) + " markets")
     except Exception as e:
         log("Fetch failed: " + str(e), "ERROR"); return
-    valid_count = 0; rejected_count = 0; dust_rejected = 0; signals = []
+    valid_count = 0; rejected_count = 0; dust_count = 0; signals = []
     for m in markets:
         v, reason = validate_market(m)
         if not v:
@@ -166,16 +219,13 @@ def scan(conn):
         for scorer in [score_f6_sports, score_f7_crypto, score_f8_political, score_f1_longshot]:
             sig = scorer(m, prob, hours)
             if sig is None: continue
-            # Calculate stake and payout — returns (0,0) if payout < $5
             stake, max_payout = calc_stake(prob, sig["direction"], balance)
             if stake == 0:
-                dust_rejected += 1
+                dust_count += 1
                 conn.execute("INSERT INTO v4_rejected (scanned_at,market_id,question,reason) VALUES (?,?,?,?)",
-                    (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""),
-                     "payout <$5 DUST"))
+                    (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""), "payout <$5 DUST"))
                 break
-            sig["market"] = m; sig["size"] = stake; sig["max_payout"] = max_payout
-            sig["hours_to_resolve"] = hours
+            sig["market"] = m; sig["size"] = stake; sig["max_payout"] = max_payout; sig["hours_to_resolve"] = hours
             valid_sig, r2 = validate_signal(sig, balance, daily, weekly, monthly, open_n)
             conn.execute("INSERT INTO v4_signals (scanned_at,market_id,question,rule,direction,confidence,liquidity,hours_to_resolve,valid,reject_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""),
@@ -183,7 +233,7 @@ def scan(conn):
             if valid_sig: signals.append(sig)
             break
     conn.commit()
-    log("Valid: " + str(valid_count) + " | Ghost-rejected: " + str(rejected_count) + " | Dust-rejected: " + str(dust_rejected) + " | Signals: " + str(len(signals)))
+    log("Valid: " + str(valid_count) + " | Ghost-rejected: " + str(rejected_count) + " | Dust-rejected: " + str(dust_count) + " | Signals: " + str(len(signals)))
     signals.sort(key=lambda s: -s["confidence"])
     placed = 0
     for sig in signals:
@@ -191,12 +241,11 @@ def scan(conn):
         existing = conn.execute("SELECT COUNT(*) FROM v4_trades WHERE market_id=? AND status=?",(sig["market"].get("id"),"open")).fetchone()[0]
         if existing: continue
         m = sig["market"]
-        log("[DRY] " + sig["rule"] + " " + sig["direction"] + " " + str(round(sig["confidence"]*100)) + "% $" + str(sig["size"]) + " -> max +$" + str(sig["max_payout"]) + " | " + (m.get("question","")[:50]))
+        log("[DRY] " + sig["rule"] + " " + sig["direction"] + " " + str(round(sig["confidence"]*100)) + "% $" + str(sig["size"]) + " -> max +$" + str(sig["max_payout"]) + " | " + (m.get("question","")[:55]))
         conn.execute("INSERT INTO v4_trades (opened_at,market_id,question,rule,direction,entry_price,stake,max_payout,hours_to_resolve,liquidity,volume24h,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""),
              sig["rule"], sig["direction"], sig["confidence"] if sig["direction"]=="YES" else 1-sig["confidence"],
-             sig["size"], sig["max_payout"], sig["hours_to_resolve"],
-             m.get("liquidityNum",0), m.get("volume24hr",0),
+             sig["size"], sig["max_payout"], sig["hours_to_resolve"], m.get("liquidityNum",0), m.get("volume24hr",0),
              "liq:$" + str(round((m.get("liquidityNum",0))/1000)) + "K payout:$" + str(sig["max_payout"])))
         conn.commit()
         placed += 1
@@ -234,20 +283,19 @@ def show_status(conn):
     closed  = conn.execute("SELECT * FROM v4_trades WHERE status=?",("closed",)).fetchall()
     open_t  = conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
     print("\n" + "="*70)
-    print("POLYWATCH v4 STATUS")
+    print("POLYWATCH v4.1 STATUS")
     print("="*70)
     print("Balance: $" + str(round(balance,2)) + " | P&L: $" + str(round(balance-BANKROLL,2)) + " | Today: $" + str(round(daily,2)) + " | Week: $" + str(round(weekly,2)))
     print("Open: " + str(len(open_t)) + " | Closed: " + str(len(closed)))
     if closed:
         wins = [t for t in closed if t[14]=="WIN"]
         wr   = len(wins)/len(closed)*100
-        wpnl = sum(t[15] for t in wins if t[15])
-        lpnl = sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
+Fix F6 — ban esports, raise confidence to 80%, major leagues only, $100k liq        lpnl = sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
         pf   = wpnl / abs(lpnl) if lpnl else 999
         print("WR: " + str(round(wr,1)) + "% | Profit Factor: " + str(round(pf,2)))
         stats = {"total_trades":len(closed),"win_rate":wr/100,"profit_factor":pf,
                  "max_drawdown_pct":0,"ghost_count":0,
-                 "liquid_market_trades":sum(1 for t in closed if (t[10] or 0)>=30000)}
+                 "liquid_market_trades":sum(1 for t in closed if (t[10] or 0)>=100000)}
         ok, checks = check_go_live_criteria(stats)
         print("\nGo-Live Day 30: " + ("READY" if ok else "NOT YET"))
         for k, v in checks.items():
