@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-POLYWATCH SCANNER v4.1 — capital preservation
+POLYWATCH SCANNER v4.1 - capital preservation
 
 F6 FIX (post KT Rolster loss):
   - Esports BANNED (LoL, Dota, CS2, Valorant, gaming)
-  - Min confidence raised 70% → 80%
+  - Min confidence raised 70% to 80%
   - Major leagues only (UCL, EPL, NBA, NFL, MLB, La Liga, ATP, Grand Slam)
-  - Min liquidity raised $50k → $100k
+  - Min liquidity raised 50k to 100k
   - No qualifiers, no lower-tier tournaments
 """
 import os, sys, json, sqlite3, datetime, urllib.request, traceback
@@ -24,7 +24,6 @@ HEADERS  = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
 BANKROLL = float(os.environ.get("BANKROLL", BANKROLL_TARGET))
 MIN_PAYOUT_HARD = 5.0
 
-# F6 ALLOWED LEAGUES — major only, no qualifiers, no esports
 F6_MAJOR_LEAGUES = [
     "champions league", "ucl", "europa league",
     "premier league", "epl", "la liga", "bundesliga", "serie a", "ligue 1",
@@ -32,11 +31,9 @@ F6_MAJOR_LEAGUES = [
     "nba", "nfl", "mlb", "nhl",
     "super bowl", "nba finals", "world series", "stanley cup",
     "wimbledon", "us open", "french open", "australian open", "grand slam",
-    "atp finals", "davis cup",
-    "ufc", "boxing",
+    "atp finals", "davis cup", "ufc", "boxing",
 ]
 
-# F6 BANNED — esports and lower-tier events
 F6_BANNED = [
     "league of legends", "lol", "lck", "lcs", "lec",
     "dota", "dota 2", "cs2", "csgo", "valorant", "overwatch",
@@ -110,45 +107,18 @@ def calc_stake(prob, direction, balance):
     if payout < MIN_PAYOUT_HARD: return 0, 0
     return round(stake, 2), payout
 
-# ── F6: SPORTS ──────────────────────────────────────────────────
 def score_f6_sports(m, prob, hours):
-    """
-    FIX v4.1: Esports banned. Major leagues only. 80%+ confidence. $100k liq.
-    """
+    """F6 v4.1: esports banned, major leagues only, 80%+ confidence, 100k liq."""
     q = m.get("question","").lower()
-
-    # 1. Ban esports and lower-tier events first
-    if any(x in q for x in F6_BANNED):
-        return None
-
-    # 2. Must be a recognised major league/tournament
-    is_major = any(x in q for x in F6_MAJOR_LEAGUES)
-    if not is_major:
-        return None
-
-    # 3. Must look like a match (vs. pattern)
-    if "vs." not in q and " vs " not in q:
-        return None
-
-    # 4. Confidence 80-92% (raised from 70%)
-    if not (0.80 <= prob <= 0.92):
-        return None
-
-    # 5. Spread < 1.0%
-    if (m.get("spread") or 1.0) > 0.010:
-        return None
-
-    # 6. Liquidity > $100k (raised from $50k)
-    if (m.get("liquidityNum") or 0) < 100000:
-        return None
-
-    # 7. Resolves in 2-24 hours
-    if hours < 2 or hours > 24:
-        return None
-
+    if any(x in q for x in F6_BANNED): return None
+    if not any(x in q for x in F6_MAJOR_LEAGUES): return None
+    if "vs." not in q and " vs " not in q: return None
+    if not (0.80 <= prob <= 0.92): return None
+    if (m.get("spread") or 1.0) > 0.010: return None
+    if (m.get("liquidityNum") or 0) < 100000: return None
+    if hours < 2 or hours > 24: return None
     return {"rule":"F6_sports","direction":"YES","confidence":prob}
 
-# ── F7: CRYPTO BINARY ───────────────────────────────────────────
 def score_f7_crypto(m, prob, hours):
     q = m.get("question","").lower()
     if not any(x in q for x in ["bitcoin above","btc above","btc below","bitcoin below","ethereum above","eth above","ethereum below","eth below"]): return None
@@ -161,7 +131,6 @@ def score_f7_crypto(m, prob, hours):
     if nr[0] <= prob <= nr[1]: return {"rule":"F7_crypto","direction":"NO","confidence":1-prob}
     return None
 
-# ── F8: POLITICAL / NEWS ────────────────────────────────────────
 def score_f8_political(m, prob, hours):
     q = m.get("question","").lower()
     political = any(x in q for x in ["will trump","ceasefire","executive order","tariff","shutdown","fomc","interest rate","federal reserve","will congress","will senate"])
@@ -175,21 +144,17 @@ def score_f8_political(m, prob, hours):
     if nr[0] <= prob <= nr[1]: return {"rule":"F8_political","direction":"NO","confidence":1-prob}
     return None
 
-# ── F1: LONGSHOT NO ─────────────────────────────────────────────
 def score_f1_longshot(m, prob, hours):
     cfg = STRICT_RULES["F1_longshot_no"]
     if hours < cfg["min_hours"] or hours > cfg["max_hours"]: return None
     if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
     q = m.get("question","").lower()
-    # Must be a major championship outright winner
     eligible = any(x in q for x in ["world cup","champions league","super bowl","nba finals","stanley cup","world series","masters","f1 championship","wimbledon","us open tennis","french open","australian open"])
     if not eligible: return None
-    # Reject if esports snuck in
     if any(x in q for x in F6_BANNED): return None
     if prob < 0.05 or prob > 0.12: return None
     return {"rule":"F1_longshot_no","direction":"NO","confidence":1-prob}
 
-# ── SCAN ────────────────────────────────────────────────────────
 def scan(conn):
     balance = get_balance(conn)
     daily   = get_pnl_window(conn, 24)
@@ -290,7 +255,8 @@ def show_status(conn):
     if closed:
         wins = [t for t in closed if t[14]=="WIN"]
         wr   = len(wins)/len(closed)*100
-Fix F6 — ban esports, raise confidence to 80%, major leagues only, $100k liq        lpnl = sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
+        wpnl = sum(t[15] for t in wins if t[15])
+        lpnl = sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
         pf   = wpnl / abs(lpnl) if lpnl else 999
         print("WR: " + str(round(wr,1)) + "% | Profit Factor: " + str(round(pf,2)))
         stats = {"total_trades":len(closed),"win_rate":wr/100,"profit_factor":pf,
