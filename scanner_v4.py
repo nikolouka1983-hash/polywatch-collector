@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""POLYWATCH SCANNER v4 — capital preservation"""
+"""POLYWATCH SCANNER v4 — capital preservation. No trade under $5 payout."""
 import os, sys, json, sqlite3, datetime, urllib.request, traceback
 
 try:
@@ -8,11 +8,14 @@ try:
 except ImportError:
     print("validator.py missing"); sys.exit(1)
 
-DB_PATH = os.environ.get("POLYWATCH_DB", "polywatch.db")
+DB_PATH  = os.environ.get("POLYWATCH_DB", "polywatch.db")
 LOG_FILE = "scanner_v4.log"
-GAMMA = "https://gamma-api.polymarket.com"
-HEADERS = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
+GAMMA    = "https://gamma-api.polymarket.com"
+HEADERS  = {"User-Agent":"Mozilla/5.0","Accept":"application/json"}
 BANKROLL = float(os.environ.get("BANKROLL", BANKROLL_TARGET))
+
+# Hard minimum payout — no trade earns less than this
+MIN_PAYOUT_HARD = 5.0
 
 def log(msg, level="INFO"):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -45,13 +48,11 @@ def init_db(conn):
 def fetch_markets():
     url = GAMMA + "/markets?limit=500&active=true&closed=false&order=volume24hr&ascending=false"
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    with urllib.request.urlopen(req, timeout=20) as r: return json.loads(r.read())
 
 def parse_prob(m):
-    ps = m.get("outcomePrices")
     try:
-        arr = json.loads(ps) if isinstance(ps,str) else ps
+        arr = json.loads(m["outcomePrices"]) if isinstance(m.get("outcomePrices"),str) else m.get("outcomePrices")
         return float(arr[0])
     except: return None
 
@@ -73,10 +74,20 @@ def get_pnl_window(conn, hours):
 def open_count(conn):
     return conn.execute("SELECT COUNT(*) FROM v4_trades WHERE status=?",("open",)).fetchone()[0]
 
-# ---- Scoring strategies ----
+def calc_stake(prob, direction, balance):
+    """Returns (stake, max_payout). Rejects if payout < MIN_PAYOUT_HARD."""
+    stake   = balance * MAX_RISK_PER_TRADE
+    entry   = prob if direction == "YES" else (1 - prob)
+    if entry <= 0 or entry >= 1: return 0, 0
+    payout  = round((stake / entry) * (1 - entry), 2)
+    if payout < MIN_PAYOUT_HARD:
+        return 0, 0  # caller checks payout == 0 to reject
+    return round(stake, 2), payout
+
+# ── Scoring strategies ──
 def score_f6_sports(m, prob, hours):
     q = m.get("question","").lower()
-    if not any(x in q for x in ["vs.","vs ","game ","match","wins game","beat","defeat","ucl","la liga","epl","nba","mlb","nhl","tennis","league of legends","lol ","dota","valorant"]): return None
+    if not any(x in q for x in ["vs.","vs ","game ","match","nba","mlb","ucl","epl","tennis","lol ","dota","valorant"]): return None
     cfg = STRICT_RULES["F6_sports"]
     if not (cfg["min_conf"] <= prob <= cfg["max_conf"]): return None
     if (m.get("spread") or 1.0) > cfg["max_spread"]: return None
@@ -86,7 +97,7 @@ def score_f6_sports(m, prob, hours):
 
 def score_f7_crypto(m, prob, hours):
     q = m.get("question","").lower()
-    if not any(x in q for x in ["bitcoin above","btc above","bitcoin below","btc below","ethereum above","eth above","ethereum below","eth below"]): return None
+    if not any(x in q for x in ["bitcoin above","btc above","btc below","bitcoin below","ethereum above","eth above"]): return None
     cfg = STRICT_RULES["F7_crypto"]
     if hours > cfg["max_hours"]: return None
     if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
@@ -98,7 +109,7 @@ def score_f7_crypto(m, prob, hours):
 
 def score_f8_political(m, prob, hours):
     q = m.get("question","").lower()
-    political = any(x in q for x in ["will trump","will biden","ceasefire","executive order","new tariff","government shutdown","impeachment","resign","fed rate","fomc","interest rate"])
+    political = any(x in q for x in ["will trump","ceasefire","executive order","tariff","shutdown","fomc","interest rate"])
     subjective = any(x in q for x in ["tweet","post","say","mention"])
     if not political or subjective: return None
     cfg = STRICT_RULES["F8_political"]
@@ -110,29 +121,28 @@ def score_f8_political(m, prob, hours):
     return None
 
 def score_f1_longshot(m, prob, hours):
+    """
+    F1: Championship/finals outright NO.
+    FIX: min_entry raised to 0.05 (5% YES) so payout at $150 stake > $7.
+         max raised to 0.12 (was 0.10) — slight widening for more signals.
+         Payout double-checked in calc_stake before trade is placed.
+    """
     cfg = STRICT_RULES["F1_longshot_no"]
     if hours < cfg["min_hours"] or hours > cfg["max_hours"]: return None
     if (m.get("liquidityNum") or 0) < cfg["min_liquidity"]: return None
     q = m.get("question","").lower()
-    eligible = any(x in q for x in ["world cup","champions league","super bowl","world series","stanley cup","nba final","f1 championship","masters"])
+    eligible = any(x in q for x in ["world cup","champions league","super bowl","nba final","stanley cup","nba finals","world series","masters","f1 championship"])
     if not eligible: return None
-    if prob < cfg["min_entry"] or prob > 0.10: return None
+    # min 5% YES so payout is meaningful, max 12% so we have edge
+    if prob < 0.05 or prob > 0.12: return None
     return {"rule":"F1_longshot_no","direction":"NO","confidence":1-prob}
-
-def calc_stake(prob, direction, balance):
-    stake = balance * MAX_RISK_PER_TRADE
-    entry = prob if direction == "YES" else (1 - prob)
-    if entry <= 0: return 0, 0
-    shares = stake / entry
-    payout = shares * (1 - entry)
-    return round(stake, 2), round(payout, 2)
 
 def scan(conn):
     balance = get_balance(conn)
-    daily = get_pnl_window(conn, 24)
-    weekly = get_pnl_window(conn, 24*7)
+    daily   = get_pnl_window(conn, 24)
+    weekly  = get_pnl_window(conn, 24*7)
     monthly = get_pnl_window(conn, 24*30)
-    open_n = open_count(conn)
+    open_n  = open_count(conn)
     log("Balance: $" + str(round(balance,2)) + " | Open: " + str(open_n) + "/" + str(MAX_OPEN_POSITIONS))
     log("P&L day=" + str(round(daily,2)) + " week=" + str(round(weekly,2)) + " month=" + str(round(monthly,2)))
     try:
@@ -140,7 +150,7 @@ def scan(conn):
         log("Fetched " + str(len(markets)) + " markets")
     except Exception as e:
         log("Fetch failed: " + str(e), "ERROR"); return
-    valid_count = 0; rejected_count = 0; signals = []
+    valid_count = 0; rejected_count = 0; dust_rejected = 0; signals = []
     for m in markets:
         v, reason = validate_market(m)
         if not v:
@@ -149,14 +159,21 @@ def scan(conn):
                 (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""), reason))
             continue
         valid_count += 1
-        prob = parse_prob(m)
+        prob  = parse_prob(m)
         if prob is None: continue
         hours = hours_until(m.get("endDate"))
         if hours is None: continue
         for scorer in [score_f6_sports, score_f7_crypto, score_f8_political, score_f1_longshot]:
             sig = scorer(m, prob, hours)
             if sig is None: continue
+            # Calculate stake and payout — returns (0,0) if payout < $5
             stake, max_payout = calc_stake(prob, sig["direction"], balance)
+            if stake == 0:
+                dust_rejected += 1
+                conn.execute("INSERT INTO v4_rejected (scanned_at,market_id,question,reason) VALUES (?,?,?,?)",
+                    (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""),
+                     "payout <$5 DUST"))
+                break
             sig["market"] = m; sig["size"] = stake; sig["max_payout"] = max_payout
             sig["hours_to_resolve"] = hours
             valid_sig, r2 = validate_signal(sig, balance, daily, weekly, monthly, open_n)
@@ -166,7 +183,7 @@ def scan(conn):
             if valid_sig: signals.append(sig)
             break
     conn.commit()
-    log("Valid: " + str(valid_count) + " | Rejected: " + str(rejected_count) + " | Signals: " + str(len(signals)))
+    log("Valid: " + str(valid_count) + " | Ghost-rejected: " + str(rejected_count) + " | Dust-rejected: " + str(dust_rejected) + " | Signals: " + str(len(signals)))
     signals.sort(key=lambda s: -s["confidence"])
     placed = 0
     for sig in signals:
@@ -174,13 +191,13 @@ def scan(conn):
         existing = conn.execute("SELECT COUNT(*) FROM v4_trades WHERE market_id=? AND status=?",(sig["market"].get("id"),"open")).fetchone()[0]
         if existing: continue
         m = sig["market"]
-        log("[DRY] " + sig["rule"] + " " + sig["direction"] + " " + str(round(sig["confidence"]*100)) + "% $" + str(sig["size"]) + " -> max $" + str(sig["max_payout"]) + " | " + (m.get("question","")[:50]))
+        log("[DRY] " + sig["rule"] + " " + sig["direction"] + " " + str(round(sig["confidence"]*100)) + "% $" + str(sig["size"]) + " -> max +$" + str(sig["max_payout"]) + " | " + (m.get("question","")[:50]))
         conn.execute("INSERT INTO v4_trades (opened_at,market_id,question,rule,direction,entry_price,stake,max_payout,hours_to_resolve,liquidity,volume24h,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (datetime.datetime.now(datetime.timezone.utc).isoformat(), m.get("id"), m.get("question",""),
              sig["rule"], sig["direction"], sig["confidence"] if sig["direction"]=="YES" else 1-sig["confidence"],
              sig["size"], sig["max_payout"], sig["hours_to_resolve"],
              m.get("liquidityNum",0), m.get("volume24hr",0),
-             "liq:$" + str(round((m.get("liquidityNum",0))/1000)) + "K"))
+             "liq:$" + str(round((m.get("liquidityNum",0))/1000)) + "K payout:$" + str(sig["max_payout"])))
         conn.commit()
         placed += 1
     log("Placed " + str(placed) + " new trades")
@@ -193,7 +210,7 @@ def resolve_open(conn, markets):
     by_id = {m.get("id"): m for m in markets}
     closed = 0
     for t in open_t:
-        mid = t[2]; m = by_id.get(mid)
+        m = by_id.get(t[2])
         if not m: continue
         prob = parse_prob(m)
         if prob is None: continue
@@ -212,10 +229,10 @@ def resolve_open(conn, markets):
 
 def show_status(conn):
     balance = get_balance(conn)
-    daily = get_pnl_window(conn, 24)
-    weekly = get_pnl_window(conn, 24*7)
-    closed = conn.execute("SELECT * FROM v4_trades WHERE status=?",("closed",)).fetchall()
-    open_t = conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
+    daily   = get_pnl_window(conn, 24)
+    weekly  = get_pnl_window(conn, 24*7)
+    closed  = conn.execute("SELECT * FROM v4_trades WHERE status=?",("closed",)).fetchall()
+    open_t  = conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
     print("\n" + "="*70)
     print("POLYWATCH v4 STATUS")
     print("="*70)
@@ -223,16 +240,16 @@ def show_status(conn):
     print("Open: " + str(len(open_t)) + " | Closed: " + str(len(closed)))
     if closed:
         wins = [t for t in closed if t[14]=="WIN"]
-        wr = len(wins)/len(closed)*100
+        wr   = len(wins)/len(closed)*100
         wpnl = sum(t[15] for t in wins if t[15])
         lpnl = sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
-        pf = wpnl / abs(lpnl) if lpnl != 0 else 999
+        pf   = wpnl / abs(lpnl) if lpnl else 999
         print("WR: " + str(round(wr,1)) + "% | Profit Factor: " + str(round(pf,2)))
-        stats = {"total_trades": len(closed), "win_rate": wr/100, "profit_factor": pf,
-                 "max_drawdown_pct": 0, "ghost_count": 0,
-                 "liquid_market_trades": sum(1 for t in closed if (t[10] or 0) >= 30000)}
+        stats = {"total_trades":len(closed),"win_rate":wr/100,"profit_factor":pf,
+                 "max_drawdown_pct":0,"ghost_count":0,
+                 "liquid_market_trades":sum(1 for t in closed if (t[10] or 0)>=30000)}
         ok, checks = check_go_live_criteria(stats)
-        print("\nGo-Live (Day 30): " + ("READY" if ok else "NOT YET"))
+        print("\nGo-Live Day 30: " + ("READY" if ok else "NOT YET"))
         for k, v in checks.items():
             print("  " + ("PASS" if v else "FAIL") + " " + k)
     print("="*70)
@@ -246,8 +263,6 @@ def main():
         log("FAILED: " + str(e), "ERROR")
         log(traceback.format_exc(), "ERROR")
         sys.exit(1)
-    finally:
-        conn.close()
+    finally: conn.close()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
