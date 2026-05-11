@@ -248,21 +248,73 @@ def resolve_open_v51(conn):
     if closed: log("Resolved "+str(closed)+" positions (errors:"+str(errors)+")")
 
 def show_status(conn):
-    balance=get_balance(conn);daily=get_pnl_window(conn,24)
+    balance=get_balance(conn)
+    daily=get_pnl_window(conn,24)
+    week=get_pnl_window(conn,24*7)
     closed=conn.execute("SELECT * FROM v4_trades WHERE status=?",("closed",)).fetchall()
     open_t=conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
-    print("\n"+"="*65);print("POLYWATCH v5.1 STATUS");print("="*65)
-    print("Balance: $"+str(round(balance,2))+" | P&L: $"+str(round(balance-BANKROLL,2))+" | Today: $"+str(round(daily,2)))
+    print("\n"+"="*70);print("POLYWATCH v5.1 STATUS");print("="*70)
+    print("Balance: $"+str(round(balance,2))+" | P&L: $"+str(round(balance-BANKROLL,2)))
+    print("Today:   $"+str(round(daily,2))+" | 7-day: $"+str(round(week,2)))
     print("Open: "+str(len(open_t))+" | Closed: "+str(len(closed)))
-    if closed:
-        wins=[t for t in closed if t[14]=="WIN"];wr=len(wins)/len(closed)*100
-        wpnl=sum(t[15] for t in wins if t[15]);lpnl=sum(t[15] for t in closed if t[14]=="LOSS" and t[15])
-        pf=wpnl/abs(lpnl) if lpnl else 999
-        print("WR: "+str(round(wr,1))+"% | PF: "+str(round(pf,2)))
-        stats={"total_trades":len(closed),"win_rate":wr/100,"profit_factor":pf,"max_drawdown_pct":0,"ghost_count":0,"liquid_market_trades":sum(1 for t in closed if(t[10] or 0)>=50000)}
-        ok,checks=check_go_live_criteria(stats);print("Go-Live: "+("READY" if ok else"NOT YET"))
-        for k,v in checks.items(): print("  "+("PASS" if v else"FAIL")+" "+k)
-    print("="*65)
+
+    if not closed:
+        print("="*70);return
+
+    wins=[t for t in closed if t[14]=="WIN"]
+    losses=[t for t in closed if t[14]=="LOSS"]
+    wr=len(wins)/len(closed)*100 if closed else 0
+    wpnl=sum(t[15] for t in wins if t[15])
+    lpnl=sum(t[15] for t in losses if t[15])
+    pf=wpnl/abs(lpnl) if lpnl else 999
+    avg_win=wpnl/len(wins) if wins else 0
+    avg_loss=lpnl/len(losses) if losses else 0
+    # Edge calculation: at this avg_win/avg_loss ratio what WR is needed to break even?
+    breakeven_wr=abs(avg_loss)/(avg_win+abs(avg_loss))*100 if (avg_win+abs(avg_loss))>0 else 0
+    edge=wr-breakeven_wr  # positive = profitable strategy
+
+    print("\n--- OVERALL ---")
+    print("Trades:    "+str(len(closed))+" ("+str(len(wins))+"W / "+str(len(losses))+"L)")
+    print("WR:        "+str(round(wr,1))+"%   PF: "+str(round(pf,2)))
+    print("Avg win:   +$"+str(round(avg_win,2))+"   Avg loss: $"+str(round(avg_loss,2)))
+    print("Breakeven: "+str(round(breakeven_wr,1))+"% WR needed | Edge: "+str(round(edge,1))+"%")
+
+    # Rolling 7-day window
+    cutoff_7d=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=24*7)).isoformat()
+    week_closed=[t for t in closed if t[13] and t[13]>cutoff_7d]
+    if week_closed:
+        w7=[t for t in week_closed if t[14]=="WIN"]
+        wr7=len(w7)/len(week_closed)*100
+        pnl7=sum(t[15] for t in week_closed if t[15])
+        print("\n--- LAST 7 DAYS ---")
+        print("Trades: "+str(len(week_closed))+"  WR: "+str(round(wr7,1))+"%  P&L: $"+str(round(pnl7,2)))
+
+    # Per-rule breakdown
+    print("\n--- BY RULE ---")
+    rules={}
+    for t in closed:
+        r=t[4] or "unknown"
+        if r not in rules: rules[r]={"w":0,"l":0,"pnl":0}
+        if t[14]=="WIN": rules[r]["w"]+=1
+        else: rules[r]["l"]+=1
+        rules[r]["pnl"]+=t[15] or 0
+    print("  "+"Rule".ljust(20)+"  W/L      WR      P&L")
+    for r in sorted(rules.keys()):
+        d=rules[r];t=d["w"]+d["l"];wr_r=d["w"]/t*100 if t else 0
+        marker="✓" if d["pnl"]>0 else "✗"
+        print("  "+r.ljust(20)+f'{d["w"]}/{d["l"]}'.ljust(8)+f'{wr_r:>5.0f}%'+f'  ${d["pnl"]:>+8.2f}  {marker}')
+
+    # Go/no-go
+    stats={"total_trades":len(closed),"win_rate":wr/100,"profit_factor":pf,"max_drawdown_pct":0,"ghost_count":0,"liquid_market_trades":sum(1 for t in closed if(t[10] or 0)>=50000)}
+    ok,checks=check_go_live_criteria(stats)
+    print("\n--- GO-LIVE READINESS ---")
+    print("Status: "+("READY" if ok else "NOT YET"))
+    for k,v in checks.items(): print("  "+("PASS" if v else "FAIL")+" "+k)
+    if edge < 0:
+        print("\n⚠️  WARNING: Edge is NEGATIVE. Strategy is losing money long-term.")
+        print("    Current avg_win/avg_loss requires "+str(round(breakeven_wr,1))+"% WR to break even.")
+        print("    Currently at "+str(round(wr,1))+"% WR.")
+    print("="*70)
 
 def main():
     conn=sqlite3.connect(DB_PATH);init_db(conn)
