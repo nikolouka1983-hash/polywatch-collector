@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""POLYWATCH SCANNER v5 - FAST MARKETS ONLY
+"""POLYWATCH SCANNER v5.1 - FAST MARKETS + RESOLVER FIX
 Max 48h. 3-5 trades/day. Crypto, Politics, Sports.
-F7 F9 F12 F13 F14 F8 F11 F10 F6"""
-import os,sys,json,sqlite3,datetime,urllib.request,traceback
+F7 F9 F12 F13 F14 F8 F11 F10 F6
+FIX: Resolver now queries each open market directly via /markets/{id}
+     to catch resolutions even after markets leave the active feed."""
+import os,sys,json,sqlite3,datetime,urllib.request,traceback,time
 try:
     from validator import(validate_market,validate_signal,check_go_live_criteria,STRICT_RULES,MAX_OPEN_POSITIONS,BANKROLL_TARGET,MAX_RISK_PER_TRADE)
 except ImportError:
@@ -37,6 +39,15 @@ def fetch_markets():
         req=urllib.request.Request(url,headers=HEADERS)
         with urllib.request.urlopen(req,timeout=20) as r: all_m.extend(json.loads(r.read()))
     return all_m
+
+def fetch_market_by_id(market_id):
+    try:
+        url=GAMMA+"/markets/"+str(market_id)
+        req=urllib.request.Request(url,headers=HEADERS)
+        with urllib.request.urlopen(req,timeout=10) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return None
 
 def parse_prob(m):
     try:
@@ -157,8 +168,9 @@ SCORERS=[score_f7_crypto,score_f9_crypto_updown,score_f12_crypto_weekly,score_f1
 
 def scan(conn):
     balance=get_balance(conn);daily=get_pnl_window(conn,24);weekly=get_pnl_window(conn,24*7);monthly=get_pnl_window(conn,24*30);open_n=open_count(conn)
-    log("v5 Balance: $"+str(round(balance,2))+" | Open: "+str(open_n)+"/"+str(MAX_OPEN_POSITIONS))
+    log("v5.1 Balance: $"+str(round(balance,2))+" | Open: "+str(open_n)+"/"+str(MAX_OPEN_POSITIONS))
     log("P&L day="+str(round(daily,2))+" week="+str(round(weekly,2))+" month="+str(round(monthly,2)))
+    resolve_open_v51(conn)
     try:
         markets=fetch_markets();log("Fetched "+str(len(markets))+" markets")
     except Exception as e:
@@ -200,32 +212,46 @@ def scan(conn):
         conn.execute("INSERT INTO v4_trades(opened_at,market_id,question,rule,direction,entry_price,stake,max_payout,hours_to_resolve,liquidity,volume24h,notes)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(datetime.datetime.now(datetime.timezone.utc).isoformat(),m.get("id"),m.get("question",""),sig["rule"],sig["direction"],sig["confidence"] if sig["direction"]=="YES" else 1-sig["confidence"],sig["size"],sig["max_payout"],sig["hours_to_resolve"],m.get("liquidityNum",0),m.get("volume24hr",0),"liq:$"+str(round((m.get("liquidityNum",0))/1000))+"K"))
         conn.commit();placed+=1
     log("Placed "+str(placed)+" new trades")
-    resolve_open(conn,markets);show_status(conn)
+    show_status(conn)
 
-def resolve_open(conn,markets):
+def resolve_open_v51(conn):
     open_t=conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
-    if not open_t: return
-    by_id={m.get("id"):m for m in markets};closed=0
+    if not open_t:
+        log("No open positions to check")
+        return
+    log("Checking "+str(len(open_t))+" open positions via direct fetch")
+    closed=0
+    errors=0
     for t in open_t:
-        m=by_id.get(t[2])
-        if not m: continue
+        market_id=t[2]
+        m=fetch_market_by_id(market_id)
+        time.sleep(0.3)
+        if m is None:
+            errors+=1
+            log("Could not fetch market "+str(market_id),"WARN")
+            continue
         prob=parse_prob(m)
         if prob is None: continue
-        if m.get("closed") or m.get("archived"):
-            outcome_yes=prob>=0.97;outcome_no=prob<=0.03
-            if not(outcome_yes or outcome_no): continue
-            won=(t[5]=="YES" and outcome_yes) or(t[5]=="NO" and outcome_no)
-            pnl=t[8] if won else-t[7];outcome="WIN" if won else"LOSS"
+        is_done=m.get("closed") or m.get("archived")
+        outcome_yes=prob>=0.97
+        outcome_no=prob<=0.03
+        if is_done and (outcome_yes or outcome_no):
+            won=(t[5]=="YES" and outcome_yes) or (t[5]=="NO" and outcome_no)
+            pnl=t[8] if won else-t[7]
+            outcome="WIN" if won else"LOSS"
             conn.execute("UPDATE v4_trades SET status=?,closed_at=?,outcome=?,pnl=? WHERE id=?",("closed",datetime.datetime.now(datetime.timezone.utc).isoformat(),outcome,pnl,t[0]))
-            log(outcome+": "+(t[3] or"")[:45]+" "+t[5]+" -> $"+str(round(pnl,2)));closed+=1
+            log(outcome+": "+(t[3] or"")[:45]+" "+t[5]+" -> $"+str(round(pnl,2)))
+            closed+=1
+        elif is_done:
+            log("STALE: "+(t[3] or "")[:45]+" closed but prob="+str(round(prob*100))+"%","WARN")
     conn.commit()
-    if closed: log("Resolved "+str(closed)+" positions")
+    if closed: log("Resolved "+str(closed)+" positions (errors:"+str(errors)+")")
 
 def show_status(conn):
     balance=get_balance(conn);daily=get_pnl_window(conn,24)
     closed=conn.execute("SELECT * FROM v4_trades WHERE status=?",("closed",)).fetchall()
     open_t=conn.execute("SELECT * FROM v4_trades WHERE status=?",("open",)).fetchall()
-    print("\n"+"="*65);print("POLYWATCH v5 STATUS");print("="*65)
+    print("\n"+"="*65);print("POLYWATCH v5.1 STATUS");print("="*65)
     print("Balance: $"+str(round(balance,2))+" | P&L: $"+str(round(balance-BANKROLL,2))+" | Today: $"+str(round(daily,2)))
     print("Open: "+str(len(open_t))+" | Closed: "+str(len(closed)))
     if closed:
