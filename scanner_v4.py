@@ -99,7 +99,7 @@ def score_f9_crypto_updown(m,prob,hours):
 
 def score_f12_crypto_weekly(m,prob,hours):
     q=m.get("question","").lower()
-    if not any(x in q for x in["bitcoin","btc","ethereum","eth","solana","xrp"]): return None
+    if not any(x in q for x in["bitcoin","btc","ethereum","eth","solana","sol ","xrp","dogecoin","doge","cardano","ada","binance coin","bnb","avalanche","avax","chainlink","link","polkadot","dot","polygon","matic","litecoin","ltc","sui","near","tron","trx","hyperliquid","hype"]): return None
     if"up or down"in q: return None
     if"above"not in q and"below"not in q and"reach"not in q and"exceed"not in q: return None
     if hours>48 or(m.get("liquidityNum") or 0)<10000 or(m.get("spread") or 1.0)>0.015: return None
@@ -120,8 +120,8 @@ def score_f14_over_under(m,prob,hours):
     is_ou=("o/u"in q or"over/under"in q or"over 1.5"in q or"over 2.5"in q or"under 1.5"in q or"under 2.5"in q or"total goals"in q)
     if not is_ou or any(x in q for x in BANNED): return None
     if hours>24 or(m.get("liquidityNum") or 0)<30000 or(m.get("spread") or 1.0)>0.015: return None
-    if prob>=0.80: return{"rule":"F14_over_under","direction":"YES","confidence":prob}
-    if prob<=0.20: return{"rule":"F14_over_under","direction":"NO","confidence":1-prob}
+    if prob>=0.75: return{"rule":"F14_over_under","direction":"YES","confidence":prob}
+    if prob<=0.25: return{"rule":"F14_over_under","direction":"NO","confidence":1-prob}
     return None
 
 def score_f8_political(m,prob,hours):
