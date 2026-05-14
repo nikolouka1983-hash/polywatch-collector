@@ -36,18 +36,6 @@ jobs:
           path: polywatch.db
           key: polywatch-v4-db-${{ github.run_id }}
 
-      - name: Upload log
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: scanner-v4-log-${{ github.run_id }}
-          path: scanner_v4.log
-          retention-days: 14
-
-      - name: Upload database snapshot
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: polywatch-db-${{ github.run_id }}
-          path: polywatch.db
-          retention-days: 7
+      # NO artifacts uploaded - DB is cached, log is in run output.
+      # Storage was hitting 787 artifacts x ~100KB = 76MB cycling rapidly.
+      # On-demand DB inspection: trigger workflow_dispatch with debug flag.

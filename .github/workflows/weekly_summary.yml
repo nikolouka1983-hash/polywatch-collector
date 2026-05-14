@@ -46,4 +46,4 @@ jobs:
         with:
           name: weekly-summary-${{ github.run_id }}
           path: /tmp/weekly_summary.md
-          retention-days: 90
+          retention-days: 28
