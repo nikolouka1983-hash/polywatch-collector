@@ -104,7 +104,8 @@ def validate_signal(sig, current_balance, daily_pnl, weekly_pnl, monthly_pnl, op
         return False, "max positions (" + str(open_count) + "/" + str(MAX_OPEN_POSITIONS) + ")"
     stake = sig.get("size") or sig.get("stake") or 0
     max_stake = current_balance * MAX_RISK_PER_TRADE
-    if stake > max_stake:
+    # Allow 1 cent tolerance for float rounding (calc_stake rounds to 2 decimals)
+    if stake > max_stake + 0.01:
         return False, "stake $" + str(round(stake, 2)) + " > max $" + str(round(max_stake, 2))
     payout = sig.get("max_payout") or 0
     if payout < MIN_PAYOUT:
