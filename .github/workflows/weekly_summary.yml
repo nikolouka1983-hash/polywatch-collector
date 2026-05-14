@@ -1,0 +1,49 @@
+name: Weekly Summary
+
+on:
+  schedule:
+    # Every Friday at 18:00 UTC (19:00 Athens, 20:00 Nicosia)
+    - cron: "0 18 * * 5"
+  workflow_dispatch:
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore database
+        uses: actions/cache@v4
+        with:
+          path: polywatch.db
+          key: polywatch-v4-db-${{ github.run_id }}
+          restore-keys: polywatch-v4-db-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate weekly summary
+        run: python weekly_summary.py | tee /tmp/weekly_summary.md
+
+      - name: Create GitHub Issue with summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date +"%Y-%m-%d")
+          TITLE="📊 Weekly Summary — $DATE"
+          gh issue create --title "$TITLE" --body-file /tmp/weekly_summary.md --label "weekly-summary" || \
+            gh issue create --title "$TITLE" --body-file /tmp/weekly_summary.md
+
+      - name: Upload summary artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: weekly-summary-${{ github.run_id }}
+          path: /tmp/weekly_summary.md
+          retention-days: 90
