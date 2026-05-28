@@ -123,8 +123,8 @@ def main():
 
     # Go-live readiness
     out.append(f"\n## 🏁 Go-Live Readiness\n")
-    out.append(f"_Target deployment: June 1, 2026_\n")
-    days_to_golive = (datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc) - now).days
+    out.append(f"_Target deployment: July 1, 2026 (extended from June 1 for more data)_\n")
+    days_to_golive = (datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc) - now).days
     out.append(f"- **Days until decision:** {days_to_golive}")
     out.append(f"- **Closed trades:** {len(all_closed)} / 80 needed ({len(all_closed)/80*100:.0f}%)")
     out.append(f"- **Win rate:** {wr:.1f}% (need ≥70%) — {'✅ PASS' if wr >= 70 else '❌ FAIL'}")
