@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""POLYWATCH SCANNER v6.0 - CRYPTO ONLY
-Max 48h. Crypto markets only. 8 concurrent positions.
+"""POLYWATCH SCANNER v6.1 - CRYPTO ONLY
+Max 48h. Crypto markets only. 12 concurrent positions.
 Rules: F7 (binary above/below), F9 (up/down daily), F12 (level markets)
-Killed: F6, F8, F10, F11, F13, F14 (all non-crypto + sports = no edge)"""
+Killed: F6, F8, F10, F11, F13, F14 (all non-crypto + sports = no edge)
+v6.1: F9 prioritized in signal sort (proven edge source), max positions 8→12"""
 import os,sys,json,sqlite3,datetime,urllib.request,traceback,time
 try:
     from validator import(validate_market,validate_signal,check_go_live_criteria,STRICT_RULES,BANKROLL_TARGET,MAX_RISK_PER_TRADE)
@@ -15,8 +16,8 @@ HEADERS={"User-Agent":"Mozilla/5.0","Accept":"application/json"}
 BANKROLL=float(os.environ.get("BANKROLL",BANKROLL_TARGET))
 MIN_PAYOUT_HARD=5.0
 MAX_HOURS=48
-# v6.0: Increased from 4 to 8 to capture more crypto trades simultaneously
-MAX_OPEN_POSITIONS=8
+# v6.1: Increased 8→12 to capture more F9 signals (F9 is the true edge source)
+MAX_OPEN_POSITIONS=12
 
 # Expanded crypto coverage — most liquid coins on Polymarket
 CRYPTO_KEYWORDS=["bitcoin","btc","ethereum","eth","solana","sol ","xrp","ripple","dogecoin","doge","cardano","ada","binance coin","bnb","avalanche","avax","chainlink","link","polkadot","dot","polygon","matic","litecoin","ltc","sui ","near","tron","trx","hyperliquid","hype","stellar","xlm","cosmos","atom","aptos","apt","arbitrum","arb","optimism","op ","aave","uniswap","uni "]
@@ -156,8 +157,10 @@ def scan(conn):
             break
     conn.commit()
     log("Valid:"+str(valid_count)+" | Ghost:"+str(rejected_count)+" | Dust:"+str(dust_count)+" | Signals:"+str(len(signals)))
-    # Sort by payout (highest EV first)
-    signals.sort(key=lambda s:-s["max_payout"])
+    # v6.1: Sort priority — F9 first (proven edge +2.2%), then F7 (high-conf), then F12
+    # Within each rule, sort by max_payout descending (highest EV first)
+    rule_priority={"F9_crypto_updown":0,"F7_crypto":1,"F12_crypto_level":2}
+    signals.sort(key=lambda s:(rule_priority.get(s["rule"],99),-s["max_payout"]))
     placed=0
     for sig in signals:
         if open_count(conn)>=MAX_OPEN_POSITIONS: break
