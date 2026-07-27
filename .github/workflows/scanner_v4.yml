@@ -4,20 +4,63 @@ on:
   schedule:
     - cron: "15 * * * *"
   workflow_dispatch:
+    inputs:
+      allow_fresh_db:
+        description: "Allow starting from empty DB (dangerous - only for reset)"
+        required: false
+        default: "false"
+        type: string
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore database
-        uses: actions/cache@v4
+      # PRIMARY RESTORE: GitHub Actions cache
+      - name: Restore database from cache
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: polywatch.db
           key: polywatch-v4-db-${{ github.run_id }}
           restore-keys: polywatch-v4-db-
+
+      # BACKUP RESTORE: if cache miss, try git backup branch
+      - name: Restore from git backup (fallback)
+        if: steps.cache.outputs.cache-matched-key == ''
+        run: |
+          echo "⚠️ Cache restore failed - trying git backup branch"
+          if git ls-remote --heads origin db-backup | grep -q db-backup; then
+            git fetch origin db-backup:db-backup 2>&1 || true
+            git checkout db-backup -- polywatch.db 2>&1 || true
+            if [ -f polywatch.db ]; then
+              echo "✅ Restored polywatch.db from git backup ($(stat -c%s polywatch.db) bytes)"
+            else
+              echo "❌ No git backup available"
+            fi
+          else
+            echo "ℹ️ db-backup branch does not exist yet"
+          fi
+
+      # SAFETY GATE: refuse to silently start fresh
+      - name: Verify database restored
+        run: |
+          if [ ! -f polywatch.db ]; then
+            if [ "${{ github.event.inputs.allow_fresh_db }}" = "true" ]; then
+              echo "🆕 Fresh DB explicitly allowed - proceeding"
+            else
+              echo "❌ FATAL: polywatch.db not found and allow_fresh_db=false"
+              echo "Prevents silent database resets. To reset manually:"
+              echo "  gh workflow run scanner_v4.yml -f allow_fresh_db=true"
+              exit 1
+            fi
+          else
+            echo "✅ DB present: $(stat -c%s polywatch.db) bytes"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,13 +72,35 @@ jobs:
         env:
           BANKROLL: "10000"
 
-      - name: Save database
-        uses: actions/cache/save@v4
+      # PRIMARY SAVE: to Actions cache
+      - name: Save database to cache
         if: always()
+        uses: actions/cache/save@v4
         with:
           path: polywatch.db
           key: polywatch-v4-db-${{ github.run_id }}
 
-      # NO artifacts uploaded - DB is cached, log is in run output.
-      # Storage was hitting 787 artifacts x ~100KB = 76MB cycling rapidly.
-      # On-demand DB inspection: trigger workflow_dispatch with debug flag.
+      # BACKUP SAVE: commit to db-backup branch every 6h at 03/09/15/21 UTC
+      - name: Backup DB to git branch (every 6h)
+        if: always() && hashFiles('polywatch.db') != ''
+        run: |
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" = "03" ] || [ "$HOUR" = "09" ] || [ "$HOUR" = "15" ] || [ "$HOUR" = "21" ]; then
+            git config user.email "bot@polywatch"
+            git config user.name "polywatch-bot"
+            cp polywatch.db /tmp/polywatch.db.backup
+            if git ls-remote --heads origin db-backup | grep -q db-backup; then
+              git fetch origin db-backup:db-backup 2>&1 || true
+              git checkout db-backup 2>&1
+            else
+              git checkout --orphan db-backup
+              git rm -rf . 2>&1 || true
+            fi
+            cp /tmp/polywatch.db.backup polywatch.db
+            git add polywatch.db
+            git commit -m "DB backup $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 || echo "no changes"
+            git push origin db-backup 2>&1 || echo "push failed - non-fatal"
+            echo "✅ Backup committed to db-backup branch"
+          else
+            echo "ℹ️ Not a backup hour ($HOUR UTC) - skipped"
+          fi
