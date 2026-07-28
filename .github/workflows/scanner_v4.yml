@@ -88,7 +88,8 @@ jobs:
           if [ "$HOUR" = "03" ] || [ "$HOUR" = "09" ] || [ "$HOUR" = "15" ] || [ "$HOUR" = "21" ]; then
             git config user.email "bot@polywatch"
             git config user.name "polywatch-bot"
-            cp polywatch.db /tmp/polywatch.db.backup
+            # Move DB out of working tree so branch checkout doesn't collide
+            mv polywatch.db /tmp/polywatch.db.backup
             if git ls-remote --heads origin db-backup | grep -q db-backup; then
               git fetch origin db-backup:db-backup 2>&1 || true
               git checkout db-backup 2>&1
@@ -96,10 +97,15 @@ jobs:
               git checkout --orphan db-backup
               git rm -rf . 2>&1 || true
             fi
+            # Copy DB onto backup branch working tree
             cp /tmp/polywatch.db.backup polywatch.db
             git add polywatch.db
             git commit -m "DB backup $(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 || echo "no changes"
             git push origin db-backup 2>&1 || echo "push failed - non-fatal"
+            # Return to main and restore the DB for the cache save step
+            rm polywatch.db
+            git checkout main 2>&1 || true
+            cp /tmp/polywatch.db.backup polywatch.db
             echo "✅ Backup committed to db-backup branch"
           else
             echo "ℹ️ Not a backup hour ($HOUR UTC) - skipped"
